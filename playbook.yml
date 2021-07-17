@@ -1,0 +1,305 @@
+---
+
+- name: postgres-cluster-example
+  # connection: network_cli
+  gather_facts: true
+  hosts: nodes
+  become: yes
+  tasks:
+    - set_fact:
+        mask_cidr: "{{ ip | ipaddr('prefix') }}"
+      vars:
+        ip: "{{ ansible_default_ipv4.network }}/{{ ansible_default_ipv4.netmask }}"
+    - name: install packages
+      become: yes
+      apt:
+        name:
+          - ntp
+          - curl
+          - python
+          - python-dev
+          - python-pip
+          - less
+          - policykit-1
+        state: latest
+    - name: add an PostgreSQL apt signing key
+      become: yes
+      apt_key:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+    - name: add PostgreSQL repo
+      become: yes
+      apt_repository:
+        repo: deb http://apt.postgresql.org/pub/repos/apt/ stretch-pgdg main
+        state: present
+    - name: set timezone to America/Argentina/Buenos_Aires
+      timezone:
+        name: America/Argentina/Buenos_Aires
+      become: yes
+      become_method: sudo
+    - name: ensure a en_US.UTF-8 locale exists
+      locale_gen:
+        name: en_US.UTF-8
+        state: present
+      become: yes
+    - name: install Postgres packages
+      become: yes
+      apt:
+        name:
+          - postgresql-9.4
+          - postgresql-client-9.4
+          - postgresql-contrib-9.4
+          - postgresql-server-dev-9.4
+        state: present
+    - name: turning off postgresql autostart from config
+      become: yes
+      lineinfile:
+        dest: /etc/postgresql/9.4/main/start.conf
+        regexp: '^auto'
+        line: 'manual'
+    - name: disable postgresql service autostart (will be managed by Patroni)
+      become: yes
+      service:
+        name: postgresql
+        enabled: no
+    - name: stop postgresql service on slave (will be managed by Patroni)
+      become: yes
+      service:
+        name: postgresql
+        state: stopped
+    - name: clean artifact path on slave
+      become: yes
+      file:
+        state: absent
+        path: /var/lib/postgresql/9.4/main
+    - name: generate config-file pg_hba
+      become: yes
+      template:
+        src: pg_hba.j2
+        dest: /etc/postgresql/9.4/main/pg_hba.conf
+        owner: postgres
+    - name: add `postgres` user to sudoers
+      become: yes
+      user:
+        name: postgres
+        groups: sudo
+        append: yes
+    - name: extract etcd into /tmp
+      unarchive:
+        src: https://github.com/etcd-io/etcd/releases/download/v3.3.10/etcd-v3.3.10-linux-amd64.tar.gz
+        dest: /tmp/
+        remote_src: yes
+    - name: copy etcd binary file
+      become: yes
+      become_method: sudo
+      copy:
+        src: /tmp/etcd-v3.3.10-linux-amd64/etcd
+        dest: /usr/local/bin/etcd
+        mode: u+x,g+x,o+x
+        remote_src: yes
+    - name: copy etcdctl binary file
+      become: yes
+      become_method: sudo
+      copy:
+        src: /tmp/etcd-v3.3.10-linux-amd64/etcdctl
+        dest: /usr/local/bin/etcdctl
+        mode: u+x,g+x,o+x
+        remote_src: yes
+    - name: create etcd directory
+      become: yes
+      file:
+        path: /etc/etcd
+        state: directory
+    - name: copy config-file etcd.conf
+      become: yes
+      template:
+        src: etcd.j2
+        dest: /etc/etcd/etcd.conf
+    - name: add etcd user
+      become: yes
+      user:
+        name: etcd
+        shell: /usr/sbin/nologin
+        home: /var/lib/etcd
+    - name: create systemd directory
+      become: yes
+      file:
+        path: /usr/lib/systemd/system/
+        state: directory
+    - name: copy systemd service file
+      become: yes
+      copy:
+        src: etcd.service
+        dest: /usr/lib/systemd/system/etcd.service
+    - name: force systemd to reread configs
+      become: yes
+      systemd:
+        name: etcd
+        daemon_reload: yes
+    - name: enable service etcd and ensure it is not masked
+      become: yes
+      systemd:
+        name: etcd
+        state: started
+        enabled: yes
+      register: etcd_status
+    - debug: msg="Etcd service is Running"
+      when: etcd_status.status.SubState.find("running") != -1
+    - name: copy python requirements.txt file
+      become: yes
+      copy:
+        src: requirements.txt
+        dest: /tmp/requirements.txt
+    - name: install python requirements
+      pip:
+        requirements: /tmp/requirements.txt
+    - name: install Patroni
+      become: yes
+      pip:
+        name:
+          - patroni
+          - python-etcd
+        state: latest
+    - name: create Patroni directory
+      become: yes
+      file:
+        path: /etc/patroni
+        state: directory
+    - name: generate config-file patroni.yml
+      become: yes
+      template:
+        src: patroni.j2
+        dest: /etc/patroni/patroni.yml
+    - name: copy systemd service file
+      become: yes
+      copy:
+        src: patroni.service
+        dest: /usr/lib/systemd/system/patroni.service
+    - name: alter postgres DB pwd
+      command: psql -U postgres -c "ALTER ROLE postgres WITH ENCRYPTED PASSWORD 'postgres';"
+      when: not "{{ isSlave }}"
+    - name: enable service patroni and ensure it is not masked on master-node
+      become: yes
+      systemd:
+        name: patroni
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: not {{ isSlave }}
+
+    # - name: Execute the command in remote shell; stdout goes to the specified file on the remote.
+    #   become: yes
+    #   shell: |
+    #     set timeout 300
+    #     spawn patronictl -c /etc/patroni/patroni.yml restart pgcluster-tst {{ inventory_hostname }}
+
+    #     expect "Are you sure you want to restart members {{ inventory_hostname }}? [y/N]:"
+    #     send "y\r"
+
+    #     expect "Restart if the PostgreSQL version is less than provided (e.g. 9.5.2)  []:"
+    #     send "\r"
+
+    #     expect "When should the restart take place (e.g. 2015-10-01T14:30)  [now]:"
+    #     send "\r"
+
+    #     exit 0
+    #   args:
+    #     executable: /usr/bin/expect
+    #   when: not {{ isSlave }}
+    - name: create passwd file
+      become: yes
+      become_user: postgres
+      lineinfile:
+        path: /var/lib/postgresql/.pgpass
+        state: present
+        line: '*:*:*:replicator:rep-pass'
+        mode: 0600
+      when: not "{{ isSlave }}"
+    - name: start patroni service and ensure it is not masked on slave-nodes
+      become: yes
+      systemd:
+        name: patroni
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: "{{ isSlave }}"
+    - name: install PgBouncer
+      become: yes
+      apt:
+        name: pgbouncer
+        state: latest
+    - name: stop pgbouncer service
+      become: yes
+      systemd:
+        name: pgbouncer
+        state: stopped
+    - name: generating pgbouncer config-file
+      become: yes
+      template:
+        src: pgbouncer.j2
+        dest: /etc/pgbouncer/pgbouncer.ini
+    - name: creating pgbouncer userlist
+      become: yes
+      lineinfile:
+        dest: /etc/pgbouncer/userlist.txt
+        line: '"postgres" "postgres"'
+    - name: changing pgbouncer ulimit parameter
+      become: yes
+      lineinfile:
+        dest: /etc/init.d/pgbouncer
+        regexp: '^ulimit -n \d+'
+        line: 'ulimit -n 32768'
+    - name: start service pgbouncer and ensure it is not masked
+      become: yes
+      systemd:
+        name: pgbouncer
+        state: started
+        enabled: yes
+        daemon_reload: yes
+    - name: allow a running load balancer instance to bind to an IP that is not local for failover
+      become: yes
+      sysctl:
+        name: net.ipv4.ip_nonlocal_bind
+        value: 1
+        sysctl_set: yes
+        state: present
+        reload: yes
+    - name: ip forwarding turn on in the kernel
+      become: yes
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        sysctl_set: yes
+        state: present
+        reload: yes
+    - set_fact:
+        VIP_IP: "{{ ansible_ssh_host.split('.')[0] }}.{{ ansible_ssh_host.split('.')[1] }}.{{ ansible_ssh_host.split('.')[2] }}.{{ ansible_ssh_host.split('.')[3] | int + IPFactor }}"
+    - name: comparison VIP_IP and real IP
+      any_errors_fatal: true
+      fail: msg="Please change variable IPFactor. Real and virtual IP adresses are equal"
+      when: ansible_ssh_host == VIP_IP
+    - name: generating vip-manager config-file
+      become: yes
+      template:
+        src: vip.j2
+        dest: /etc/patroni/vip.conf
+    - name: copy vip-manager binary file to /usr/bin/
+      become: yes
+      become_method: sudo
+      copy:
+        src: vip-manager
+        dest: /usr/bin/vip-manager
+        mode: u+x,g+x,o+x
+        # remote_src: yes
+    - name: copy vip-manager systemd service file
+      become: yes
+      copy:
+        src: vip-manager.service
+        dest: /usr/lib/systemd/system/vip-manager.service
+    - name: start vip-manager service and ensure it is not masked
+      become: yes
+      systemd:
+        name: vip-manager
+        state: started
+        enabled: yes
+        daemon_reload: yes
